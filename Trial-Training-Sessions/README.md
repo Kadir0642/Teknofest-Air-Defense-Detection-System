@@ -11,6 +11,8 @@ OpenCV (Görüntü İşleme)
 
 Ultralytics (YOLOv8 & Tracking)
 
+<img width="600" height="338" alt="image" src="https://github.com/user-attachments/assets/68ed0e1c-b1cf-4951-8782-3e465dacd5bc" />
+
 
 ## 📊 Model Performance Benchmarks
 
