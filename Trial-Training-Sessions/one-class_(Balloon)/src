@@ -1,0 +1,41 @@
+!pip install ultralytics roboflow
+
+import ultralytics
+
+from ultralytics import YOLO
+
+!pip install roboflow
+
+from roboflow import Roboflow
+rf = Roboflow(api_key="*************") #Your own data set comes with an API key.
+project = rf.workspace("****").project("******")
+version = project.version(6)
+dataset = version.download("yolov8")
+
+from ultralytics import YOLO
+
+# 1. We are loading the Nano model for Transfer Learning.
+model = YOLO('yolov8n.pt')
+
+# 2. Start the training
+results = model.train(
+    data=f"{dataset.location}/data.yaml",
+    epochs=50,          
+    imgsz=640,          
+    batch=16,           
+    patience=10,        # If it doesn't develop after 10 rounds, stop (Saves time)
+    name='RENK_AYRIMLI_MODEL' # The model name will be saved in this folder.
+)
+
+
+
+# We load the best model we have
+model=YOLO('/content/runs/detect/Hava_Savunma_Modeli/weights/best.pt')
+
+# When handling official matters, we will use the bytetrack tracking algorithm.
+results=model.track(
+    source="/content/gökhisarmain-5/test/images/DS2.mp4", #the video we will test
+    save=True,
+    tracker="bytetrack.yaml"
+    #conf=0.5
+)
