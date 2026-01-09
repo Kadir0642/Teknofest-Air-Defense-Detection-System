@@ -1,0 +1,23 @@
+Stability over 50 Epochs :
+
+  -The first model ran for 15 epochs; here, we trained for 50 epochs. 
+
+Towards the end of the graph (between 40-50), val/box_loss and val/cls_loss are still trending downward. 
+
+This indicates that the model is continuing to learn and, more importantly, is not overfitting.
+
+mAP@50-95 :
+
+  -The metrics/mAP50-95 graph has reached 0.94 levels. Despite attempting to distinguish between two different 
+
+classes (which is more difficult than a single class), the model's success has increased. 
+
+This proves the quality of the data set and the success of the training.
+
+Classification Success :
+
+  -val/cls_loss (Classification loss) has dropped below 0.20. 
+
+This means the model isn't just saying “there's something there,” 
+
+it also knows “which class” it belongs to with very high accuracy.
