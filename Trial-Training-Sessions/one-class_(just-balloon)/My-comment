@@ -1,0 +1,16 @@
+Rapid Convergence:
+
+ -The model learned the patterns in the training set with over 95% accuracy within the first 5 epochs. 
+This steady decline in the loss graphs indicates that the dataset is compatible with the model's 
+capacity and that the model did not experience underfitting.
+
+High Precision & Recall: 
+
+ -In air defense systems, a ‘false negative’ (missing the target) is unacceptable. 
+A recall value of 0.99 proves that the system detects nearly all threats entering its field of view.
+
+mAP50-95 :
+
+  -In air defense systems, a ‘false negative’ (missing the target) is unacceptable. 
+A recall value of 0.99 proves that the system detects nearly all threats entering its field of view.
+
