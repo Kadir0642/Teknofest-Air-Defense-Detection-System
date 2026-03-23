@@ -1,0 +1,155 @@
+import cv2
+import numpy as np
+import time
+import math
+
+# 1. Hedef Görsellerini Yükle
+img_dron = cv2.imread(r"C:\\Users\\LENOVO\\Image_processing\\HSS-Detect-Track\\iha-test.png", cv2.IMREAD_UNCHANGED)
+img_jet = cv2.imread(r"C:\\Users\\LENOVO\\Image_processing\\HSS-Detect-Track\\jet-test.png", cv2.IMREAD_UNCHANGED)
+img_fuze = cv2.imread(r"C:\\Users\\LENOVO\\Image_processing\\HSS-Detect-Track\\fuze-test.png", cv2.IMREAD_UNCHANGED)
+img_heli = cv2.imread(r"C:\\Users\\LENOVO\\Image_processing\\HSS-Detect-Track\\heli-test.png", cv2.IMREAD_UNCHANGED)
+
+if any(img is None for img in [img_dron, img_jet, img_fuze, img_heli]):
+    print("HATA: Görsellerden biri veya birkaçı yüklenemedi. Lütfen dosya yollarını kontrol et!")
+    exit()
+
+def get_foreground(img):
+    """Arka planı siyah olan veya şeffaf olan görsellerin maskesini çıkarır"""
+    if img.shape[2] == 4: # PNG ise (Şeffaf)
+        return img[:,:,:3], img[:,:,3]
+    else: # Siyah arka planlı JPG ise
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _, mask = cv2.threshold(gray, 5, 255, cv2.THRESH_BINARY)
+        return img, mask
+
+def guclu_image_overlay(board, overlay, mask, x, y):
+    """Görsel ekrandan taşsa bile (çok büyüdüğünde) çökmemesi için güçlendirilmiş overlay fonksiyonu"""
+    h, w = overlay.shape[:2]
+    # Ekran sınırlarını hesapla
+    y1, y2 = max(0, y), min(board.shape[0], y + h)
+    x1, x2 = max(0, x), min(board.shape[1], x + w)
+    
+    # Görsel sınırlarını hesapla (Taşan kısımları kırp)
+    oy1, oy2 = max(0, -y), min(h, board.shape[0] - y)
+    ox1, ox2 = max(0, -x), min(w, board.shape[1] - x)
+
+    if y1 >= y2 or x1 >= x2:
+        return # Görsel tamamen ekran dışındaysa çizme
+
+    roi = board[y1:y2, x1:x2]
+    mask_inv = cv2.bitwise_not(mask[oy1:oy2, ox1:ox2])
+    img1_bg = cv2.bitwise_and(roi, roi, mask=mask_inv)
+    img2_fg = cv2.bitwise_and(overlay[oy1:oy2, ox1:ox2], overlay[oy1:oy2, ox1:ox2], mask=mask[oy1:oy2, ox1:ox2])
+    board[y1:y2, x1:x2] = cv2.add(img1_bg, img2_fg)
+
+
+# Hangar Ekranı Ayarları
+SCREEN_W, SCREEN_H = 1280, 720
+MERKEZ_X, MERKEZ_Y = int(SCREEN_W / 2), int(SCREEN_H / 2)
+
+LOWER_ORANGE = np.array([5, 120, 120])
+UPPER_ORANGE = np.array([25, 255, 255])
+KERNEL = np.ones((5, 5), np.uint8)
+
+FPS = 30
+DONGU_SURESI = 12 # Hedeflerin en uzaktan dibimize gelmesi kaç saniye sürsün?
+
+# Hedeflerin Orijinal Boyutları
+boyutlar = [img_dron.shape[:2], img_jet.shape[:2], img_fuze.shape[:2], img_heli.shape[:2]]
+gorseller = [img_dron, img_jet, img_fuze, img_heli]
+serit_merkezleri = [200, 490, 780, 1070] # 4 Hedef için yan yana 4 şerit
+
+frame_count = 0
+
+print("HSS - 3D Yaklaşma (Derinlik) Simülasyonu Başladı...")
+
+while True:
+    start_time = time.time()
+    hangar_ekrani = np.zeros((SCREEN_H, SCREEN_W, 3), dtype=np.uint8)
+    
+    # Namlu merkezini çiz
+    cv2.line(hangar_ekrani, (MERKEZ_X - 20, MERKEZ_Y), (MERKEZ_X + 20, MERKEZ_Y), (255, 0, 0), 2)
+    cv2.line(hangar_ekrani, (MERKEZ_X, MERKEZ_Y - 20), (MERKEZ_X, MERKEZ_Y + 20), (255, 0, 0), 2)
+    
+    t = frame_count / FPS
+    
+    # Derinlik (Z Ekseni) Simülasyonu: 0.0'dan başlayıp 1.0'a giden ilerleme
+    ilerleme = (t % DONGU_SURESI) / DONGU_SURESI
+    
+    # Ölçek: Uzaktayken %5 boyutunda (0.05), dibimize geldiğinde %180 boyutunda (1.8)
+    # Mesafe kısaldıkça hızlanma hissi vermek için karesini (ilerleme**2) alıyoruz
+    olcek = 0.05 + (ilerleme ** 2) * 1.75 
+    
+    for i in range(4):
+        h_orj, w_orj = boyutlar[i]
+        
+        # Dinamik Boyutlandırma (Derinlik Hissi)
+        yeni_w, yeni_h = int(w_orj * olcek), int(h_orj * olcek)
+        
+        if yeni_w > 5 and yeni_h > 5:
+            # Görseli Yaklaştır
+            resized_img = cv2.resize(gorseller[i], (yeni_w, yeni_h))
+            fg, mask = get_foreground(resized_img)
+            
+            # X Ekseni: Slalom Hareketi (Şeritten taşmayacak kadar, maks 80 piksel sağ-sol)
+            # Her aracın slalom frekansı (hızı) ve yönü biraz farklı olsun diye (i+1) kullandık
+            slalom_sapmasi = 80 * math.sin(t * (1.5 + i*0.2)) 
+            cizim_x = int(serit_merkezleri[i] + slalom_sapmasi - yeni_w / 2)
+            
+            # Y Ekseni: Ekranın ortasında sabit bir irtifada gelsinler
+            cizim_y = int(MERKEZ_Y - yeni_h / 2 + 50 * math.cos(t + i))
+            
+            # Ekrana Bas
+            guclu_image_overlay(hangar_ekrani, fg, mask, cizim_x, cizim_y)
+
+    
+    # --- HEDEF TESPİT VE KİLİTLENME ALGORİTMASI ---
+    hsv = cv2.cvtColor(hangar_ekrani, cv2.COLOR_BGR2HSV)
+    maske = cv2.inRange(hsv, LOWER_ORANGE, UPPER_ORANGE)
+    maske = cv2.morphologyEx(maske, cv2.MORPH_OPEN, KERNEL)
+    konturlar, _ = cv2.findContours(maske, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if konturlar:
+        aktif_hedefler = []
+        for kontur in konturlar:
+            # Hedefler uzaktayken çok küçük olacakları için alan sınırını 5 piksele kadar düşürdük!
+            if cv2.contourArea(kontur) > 5: 
+                M = cv2.moments(kontur)
+                if M["m00"] != 0:
+                    cx = int(M["m10"] / M["m00"])
+                    cy = int(M["m01"] / M["m00"])
+                    merkeze_uzaklik = math.hypot(cx - MERKEZ_X, cy - MERKEZ_Y)
+                    
+                    aktif_hedefler.append({'cx': cx, 'cy': cy, 'uzaklik': merkeze_uzaklik})
+        
+        # Namluya (Merkeze) en yakın olanı Ana Hedef seç
+        aktif_hedefler = sorted(aktif_hedefler, key=lambda x: x['uzaklik'])
+        
+        for i, hedef in enumerate(aktif_hedefler):
+            cx, cy = hedef['cx'], hedef['cy']
+            
+            if i == 0:
+                # ANA HEDEF
+                cv2.circle(hangar_ekrani, (cx, cy), max(2, int(15*olcek)), (0, 0, 255), -1)
+                cv2.line(hangar_ekrani, (MERKEZ_X, MERKEZ_Y), (cx, cy), (0, 255, 0), 2) 
+                cv2.putText(hangar_ekrani, f"LOCKED [ERR X:{cx-MERKEZ_X}]", 
+                            (cx - 60, cy - max(20, int(30*olcek))), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            else:
+                # İKİNCİL HEDEFLER
+                cv2.circle(hangar_ekrani, (cx, cy), max(1, int(8*olcek)), (0, 255, 255), -1)
+
+    # Mesafe / Zaman bilgisini ekrana yazdır
+    kalan_mesafe = round(15.0 * (1 - ilerleme), 1) # 15 metreden 0 metreye düştüğünü varsayalım
+    cv2.putText(hangar_ekrani, f"Simule Mesafe: {kalan_mesafe} Metre", (20, 40), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    cv2.imshow("Aşama 2: 3D Suru Saldirisi ve Slalom Simulasyonu", hangar_ekrani)
+    
+    elapsed_time = time.time() - start_time
+    wait_time = max(1, int((1/FPS - elapsed_time) * 1000))
+    if cv2.waitKey(wait_time) & 0xFF == ord('q'):
+        break
+    
+    frame_count += 1
+
+cv2.destroyAllWindows()
