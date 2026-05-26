@@ -1,0 +1,232 @@
+import cv2
+import numpy as np
+import math
+from ultralytics import YOLO
+
+# =========================================================
+# 1) MODEL VE SİSTEM PARAMETRELERİ
+# =========================================================
+MODEL_PATH = "best.pt"
+model = YOLO(MODEL_PATH)
+
+YOLO_IMGSZ = 640
+YOLO_CONF = 0.25
+
+# KIRMIZI renk için HSV aralıkları (Kırmızı HSV uzayında iki uçta yer alır)
+LOWER_RED_1 = np.array([0, 120, 70], dtype=np.uint8)
+UPPER_RED_1 = np.array([10, 255, 255], dtype=np.uint8)
+LOWER_RED_2 = np.array([170, 120, 70], dtype=np.uint8)
+UPPER_RED_2 = np.array([180, 255, 255], dtype=np.uint8)
+
+KERNEL = np.ones((5, 5), np.uint8)
+
+# Balon tespit filtreleri (Gürültüyü engellemek için)
+MIN_CONTOUR_AREA = 20
+MIN_CIRCULARITY = 0.50
+MIN_RADIUS = 2
+
+# =========================================================
+# 2) BBOX İÇİNDE KIRMIZI BALON MERKEZİ TESPİTİ
+# =========================================================
+def detect_red_balloon_center(frame, bbox):
+    """
+    YOLO'nun tespit ettiği BBox (sınırlayıcı kutu) içinde kırmızı renkli,
+    dairesel nesneyi (balonu) arar ve merkez koordinatlarını döndürür.
+    """
+    x1, y1, x2, y2 = bbox
+
+    # Sınır kontrolleri (BBox'ın ekran dışına taşmasını engeller)
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    # Sadece hedefin olduğu bölgeyi (ROI) kesiyoruz ki işlem gücünden tasarruf edelim
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    # Kırmızının iki ucu için maske oluşturup birleştiriyoruz
+    mask1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+    mask2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    # Morfolojik işlemler ile ufak gürültüleri (noise) temizliyoruz
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL)
+
+    # Konturları (şekil sınırlarını) buluyoruz
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        return None
+
+    # En büyük kırmızı alanı balon adayı olarak seçiyoruz
+    largest_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest_contour)
+
+    if area < MIN_CONTOUR_AREA:
+        return None
+
+    # Dairesellik (Circularity) kontrolü: Şekil gerçekten balona (yuvarlağa) benziyor mu?
+    perimeter = cv2.arcLength(largest_contour, True)
+    if perimeter == 0:
+        return None
+
+    circularity = 4 * math.pi * area / (perimeter * perimeter)
+    if circularity < MIN_CIRCULARITY:
+        return None
+
+    # Hedefin merkezini ve yarıçapını hesaplıyoruz
+    (cx_roi, cy_roi), radius = cv2.minEnclosingCircle(largest_contour)
+    if radius < MIN_RADIUS:
+        return None
+
+    # ROI içindeki merkezi, tüm ekran (global) koordinatlarına çeviriyoruz
+    global_x = int(cx_roi + x1)
+    global_y = int(cy_roi + y1)
+
+    return {
+        "center": (global_x, global_y),
+        "radius": float(radius)
+    }
+
+# =========================================================
+# 3) YOLOV8 + BYTETRACK: TESPİT VE TAKİP
+# =========================================================
+def detect_and_track(frame):
+    """
+    Karedeki (frame) nesneleri YOLO ile bulur, ByteTrack ile ID atar
+    ve içlerindeki kırmızı balonu arar.
+    """
+    results = model.track(
+        source=frame,
+        imgsz=YOLO_IMGSZ,
+        conf=YOLO_CONF,
+        tracker="bytetrack.yaml",
+        persist=True,
+        verbose=False
+    )
+
+    detections = []
+    if len(results) == 0 or results[0].boxes is None:
+        return detections
+
+    for box in results[0].boxes:
+        # BBox koordinatlarını al
+        x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int).tolist()
+        
+        # Sınıf ve ID bilgilerini güvenli bir şekilde al
+        class_id = int(box.cls[0].item()) if box.cls is not None else -1
+        track_id = int(box.id[0].item()) if box.id is not None else -1
+
+        # Eğer nesneye henüz ID atanmadıysa pas geçiyoruz
+        if track_id == -1:
+            continue
+
+        # Hedefin altındaki/içindeki balonu tespit et
+        balloon_info = detect_red_balloon_center(frame, (x1, y1, x2, y2))
+
+        detections.append({
+            "track_id": track_id,
+            "class_id": class_id,
+            "bbox": (x1, y1, x2, y2),
+            "balloon": balloon_info,
+        })
+
+    return detections
+
+# =========================================================
+# 4) MERKEZE EN YAKIN HEDEFİ SEÇME (MİMARİ OPTİMİZASYON)
+# =========================================================
+def select_closest_target(detections, frame_width, frame_height):
+    """
+    2. Aşamada hedef ayrımı olmadığı için, taretin en az eforla vurabileceği
+    yani ekranın merkezine (namlunun baktığı yere) en yakın hedefi seçer.
+    (Eski ID bazlı seçimin yerini alarak taret savrulmalarını önler)
+    """
+    if not detections:
+        return None
+
+    frame_center_x = frame_width // 2
+    frame_center_y = frame_height // 2
+
+    def calculate_distance_to_center(det):
+        # Eğer balon bulunduysa balonun merkezini, bulunamadıysa BBox merkezini baz al
+        if det["balloon"] is not None:
+            tx, ty = det["balloon"]["center"]
+        else:
+            tx = (det["bbox"][0] + det["bbox"][2]) // 2
+            ty = (det["bbox"][1] + det["bbox"][3]) // 2
+            
+        return math.hypot(tx - frame_center_x, ty - frame_center_y)
+
+    # Merkeze (Öklid uzaklığına göre) en yakın olanı döndür
+    return min(detections, key=calculate_distance_to_center)
+
+# =========================================================
+# 5) HATA DEĞERİ (ERROR) HESAPLAMA
+# =========================================================
+def calculate_target_error(frame, target):
+    """
+    Seçilen hedefin, ekranın merkezine (namluya) göre X ve Y eksenindeki 
+    sapma (hata) miktarını piksel cinsinden hesaplar.
+    """
+    frame_height, frame_width = frame.shape[:2]
+    frame_center_x = frame_width // 2
+    frame_center_y = frame_height // 2
+
+    # Öncelik her zaman kırmızısı onaylanmış balon merkezindedir
+    if target["balloon"] is not None:
+        target_x, target_y = target["balloon"]["center"]
+    else:
+        x1, y1, x2, y2 = target["bbox"]
+        target_x = (x1 + x2) // 2
+        target_y = (y1 + y2) // 2
+
+    error_x = target_x - frame_center_x
+    error_y = target_y - frame_center_y
+
+    return {
+        "target_center": (target_x, target_y),
+        "frame_center": (frame_center_x, frame_center_y),
+        "error_x": error_x,
+        "error_y": error_y,
+    }
+
+# =========================================================
+# 6) ANA ÇALIŞTIRICI FONKSİYON (HER BİR FRAME İÇİN)
+# =========================================================
+def process_frame(frame):
+    """
+    Dışarıdan çağrılacak ana fonksiyon. Kameradan gelen kareyi alır,
+    işler ve donanıma (motorlara) gönderilecek hata oranlarını döndürür.
+    """
+    frame_height, frame_width = frame.shape[:2]
+    
+    # 1. Tespit ve Takip
+    detections = detect_and_track(frame)
+
+    # 2. En uygun hedefi seç (Sürü saldırısında en yakını vur)
+    target = select_closest_target(detections, frame_width, frame_height)
+
+    if target is None:
+        return {
+            "status": "SEARCHING",
+            "detections": detections,
+            "selected_target": None,
+            "target_error": None,
+        }
+
+    # 3. Donanım için Hata hesapla
+    target_error = calculate_target_error(frame, target)
+
+    return {
+        "status": "TRACKING",
+        "detections": detections,
+        "selected_target": target,
+        "target_error": target_error,
+    }
