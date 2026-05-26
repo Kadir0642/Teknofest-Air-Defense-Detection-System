@@ -1,0 +1,240 @@
+import cv2
+import numpy as np
+import math
+from ultralytics import YOLO
+
+# =========================================================
+# 1) MODEL VE SİSTEM PARAMETRELERİ
+# =========================================================
+MODEL_PATH = "best.pt"
+model = YOLO(MODEL_PATH)
+
+YOLO_IMGSZ = 640
+YOLO_CONF = 0.25
+
+# --- RENK UZAYLARI (Dost/Düşman Ayrımı İçin) ---
+# Düşman (Kırmızı) - HSV'de iki uçta bulunur
+LOWER_RED_1 = np.array([0, 120, 70], dtype=np.uint8)
+UPPER_RED_1 = np.array([10, 255, 255], dtype=np.uint8)
+LOWER_RED_2 = np.array([170, 120, 70], dtype=np.uint8)
+UPPER_RED_2 = np.array([180, 255, 255], dtype=np.uint8)
+
+# Dost (Cyan / Camgöbeği) - Şartnamedeki koda göre
+LOWER_CYAN = np.array([80, 100, 70], dtype=np.uint8)
+UPPER_CYAN = np.array([110, 255, 255], dtype=np.uint8)
+
+KERNEL = np.ones((5, 5), np.uint8)
+
+# Balon tespit filtreleri
+MIN_CONTOUR_AREA = 20
+MIN_CIRCULARITY = 0.50
+MIN_RADIUS = 2
+
+# Hedef Tipi Mesafe Şartları (Metre) - 3. Aşama Kuralı
+RANGES = {
+    "IHA": (0, 15),
+    "Helikopter": (5, 15),
+    "Fuze": (5, 15),
+    "F16": (10, 15)
+}
+
+
+# =========================================================
+# 2) DOST / DÜŞMAN AYRIMI (IFF - Identification Friend or Foe)
+# =========================================================
+def identify_friend_or_foe(frame, bbox):
+    """
+    BBox içindeki pikselleri analiz ederek hedefin Kırmızı (Düşman) mı 
+    yoksa Cyan (Dost) mu olduğunu kesin olarak belirler.
+    Outlier mantığı yerine sahadaki en güvenli yöntem budur.
+    """
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    
+    # Güvenlik kontrolleri
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+    
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0:
+        return "UNKNOWN"
+
+    hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    
+    # Kırmızı (Düşman) maskesi ve piksel sayısı
+    mask_red1 = cv2.inRange(hsv_roi, LOWER_RED_1, UPPER_RED_1)
+    mask_red2 = cv2.inRange(hsv_roi, LOWER_RED_2, UPPER_RED_2)
+    mask_red = cv2.bitwise_or(mask_red1, mask_red2)
+    red_pixels = cv2.countNonZero(mask_red)
+    
+    # Cyan (Dost) maskesi ve piksel sayısı
+    mask_cyan = cv2.inRange(hsv_roi, LOWER_CYAN, UPPER_CYAN)
+    cyan_pixels = cv2.countNonZero(mask_cyan)
+    
+    # Basit ve etkili karar mekanizması
+    if red_pixels > cyan_pixels and red_pixels > 50: # 50 piksel gürültü filtresi
+        return "ENEMY"
+    elif cyan_pixels > red_pixels and cyan_pixels > 50:
+        return "FRIEND"
+        
+    return "UNKNOWN"
+
+
+# =========================================================
+# 3) DÜŞMAN İÇİN KIRMIZI BALON MERKEZİ TESPİTİ
+# =========================================================
+def detect_red_balloon_center(frame, bbox):
+    """
+    Turuncu yerine şartnamedeki kırmızı rengi kullanarak balonu bulur.
+    Sadece 'ENEMY' olarak işaretlenen hedeflerde çağrılmalıdır.
+    """
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+
+    roi = frame[y1:y2, x1:x2]
+    if roi.size == 0: return None
+
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+    mask2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+    mask = cv2.bitwise_or(mask1, mask2)
+
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, KERNEL)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours: return None
+
+    largest_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest_contour)
+    if area < MIN_CONTOUR_AREA: return None
+
+    perimeter = cv2.arcLength(largest_contour, True)
+    if perimeter == 0: return None
+
+    circularity = 4 * math.pi * area / (perimeter * perimeter)
+    if circularity < MIN_CIRCULARITY: return None
+
+    (cx_roi, cy_roi), radius = cv2.minEnclosingCircle(largest_contour)
+    if radius < MIN_RADIUS: return None
+
+    return {
+        "center": (int(cx_roi + x1), int(cy_roi + y1)),
+        "radius": float(radius)
+    }
+
+
+# =========================================================
+# 4) YOLOV8 + BYTETRACK: TESPİT VE SINIFLANDIRMA
+# =========================================================
+def detect_and_classify(frame):
+    results = model.track(source=frame, imgsz=YOLO_IMGSZ, conf=YOLO_CONF, 
+                          tracker="bytetrack.yaml", persist=True, verbose=False)
+    detections = []
+    
+    if len(results) == 0 or results[0].boxes is None:
+        return detections
+
+    for box in results[0].boxes:
+        xyxy = box.xyxy[0].cpu().numpy().astype(int).tolist()
+        class_id = int(box.cls[0].item()) if box.cls is not None else -1
+        track_id = int(box.id[0].item()) if box.id is not None else -1
+        class_name = model.names.get(class_id, "IHA") # Modeldeki isimler
+
+        if track_id == -1: continue
+
+        # 1. Dost mu Düşman mı?
+        iff_status = identify_friend_or_foe(frame, xyxy)
+        
+        # 2. Eğer düşmansa altındaki/içindeki balonu bul
+        balloon_info = None
+        if iff_status == "ENEMY":
+            balloon_info = detect_red_balloon_center(frame, xyxy)
+
+        detections.append({
+            "track_id": track_id,
+            "class_name": class_name,
+            "bbox": xyxy,
+            "iff_status": iff_status,
+            "balloon": balloon_info
+        })
+
+    return detections
+
+
+# =========================================================
+# 5) ANA HEDEF SEÇİMİ (SADECE DÜŞMANLAR)
+# =========================================================
+def select_enemy_target(detections, frame_width, frame_height):
+    """
+    Sadece 'ENEMY' etiketli hedefleri filtreler ve taretin en hızlı 
+    dönebileceği (merkeze en yakın) düşmanı seçer.
+    """
+    enemies = [det for det in detections if det["iff_status"] == "ENEMY"]
+    
+    if not enemies:
+        return None
+
+    frame_center_x, frame_center_y = frame_width // 2, frame_height // 2
+
+    # Merkeze en yakın düşmanı seç (Jitter ve taret savrulmasını önler)
+    return min(enemies, key=lambda d: math.hypot(
+        ((d["bbox"][0] + d["bbox"][2]) // 2) - frame_center_x,
+        ((d["bbox"][1] + d["bbox"][3]) // 2) - frame_center_y
+    ))
+
+
+# =========================================================
+# 6) HATA HESABI VE LIDAR ATEŞLEME (STATE MACHINE)
+# =========================================================
+def process_frame_stage3(frame, current_lidar_distance):
+    """
+    DONANIM EKİBİNE VERİLECEK ANA FONKSİYON.
+    Lidar mesafesini (metre) parametre olarak alır, motorlar için
+    hata payını ve atış (FIRE) emrini döndürür.
+    """
+    frame_height, frame_width = frame.shape[:2]
+    frame_center_x, frame_center_y = frame_width // 2, frame_height // 2
+    
+    detections = detect_and_classify(frame)
+    target = select_enemy_target(detections, frame_width, frame_height)
+
+    # Düşman yoksa aramaya devam et
+    if target is None:
+        return {
+            "status": "SEARCHING",
+            "error_x": 0, "error_y": 0,
+            "fire_command": False
+        }
+
+    # Hedef merkezini belirle (Öncelik kırmızı balonda)
+    if target["balloon"] is not None:
+        target_x, target_y = target["balloon"]["center"]
+    else:
+        target_x = (target["bbox"][0] + target["bbox"][2]) // 2
+        target_y = (target["bbox"][1] + target["bbox"][3]) // 2
+
+    error_x = target_x - frame_center_x
+    error_y = target_y - frame_center_y
+
+    # --- KİLİTLENME VE ATIŞ KONTROLÜ (FIRE CONTROL) ---
+    aim_tolerance = 15 # Taretin hedefin merkezine ne kadar yaklaştığı (piksel)
+    is_locked = abs(error_x) < aim_tolerance and abs(error_y) < aim_tolerance
+    fire_command = False
+
+    if is_locked:
+        # Taret hedefe kilitlendi, namlu doğru yere bakıyor. 
+        # Şimdi Lidar verisi ile menzil kuralını kontrol edebiliriz.
+        min_dist, max_dist = RANGES.get(target["class_name"], (0, 15))
+        
+        if min_dist <= current_lidar_distance <= max_dist:
+            fire_command = True # VUR!
+
+    return {
+        "status": "LOCKED" if is_locked else "TRACKING",
+        "target_class": target["class_name"],
+        "error_x": error_x,
+        "error_y": error_y,
+        "lidar_distance": current_lidar_distance,
+        "fire_command": fire_command
+    }
