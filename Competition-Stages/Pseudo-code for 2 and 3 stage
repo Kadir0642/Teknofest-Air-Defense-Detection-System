@@ -1,0 +1,166 @@
+========================================================================
+BAŞLANGIÇ AYARLARI
+========================================================================
+YÜKLE: Eğittiğimiz YOLO Modeli (Sınıflar: IHA, F16, Heli, Fuze, Kirmizi_Balon)
+YÜKLE: ByteTrack (Sadece Maketler için)
+TANIMLA: Menzil Kuralları (F16: 10-15m, IHA: 0-15m vb.)
+TANIMLA: Görüntü Merkezi (X, Y)
+
+# --- SİSTEM AYARLARI ---
+TOLERANS = 15
+HEDEF_BEKLEME_SURESI = 3  # Kaç frame stabil kalması gerekiyor?
+kilitlenme_sayaci = 0     # Sistemin hafızasındaki sayaç (ilk açıldığında sıfır)
+
+ASAMA_MODU = 3  // Arayüzden alınır (2 veya 3)
+
+========================================================================
+ANA DÖNGÜ (Her Video Karesinde)
+========================================================================
+DÖNGÜ BAŞLA:
+
+    1. GİRDİLERİ OKU
+    kare = Kameradan_Frame_Al()
+    lidar_mesafesi = Donanimdan_Lidar_Oku()
+
+    2. YOLO İLE HAM TESPİT
+    maketler = YOLO_İle_Bul(kare, Maket_Sınıfları) + ByteTrack_ID
+    tum_balonlar = YOLO_İle_Bul(kare, "Kirmizi_Balon")
+
+    3. DİNAMİK BBOX UZATMA VE ÖLÜ HEDEF ELEME
+    CANLI_MAKETLER = []
+    
+    HER BİR maket İÇİN (maketler):
+        // 1. Maketin kutusunun alt sınırını, kendi boyu kadar aşağıya uzatıyoruz.
+        // Böylece balonun fiziksel olarak bulunması gereken yeri (ROI) tespit ediyoruz.
+        // [ Maketin alt BBox çizgisini alıp, maketin yüksekliği kadar aşağıya sanal bir kutu çiziyoruz. Balonu sadece bu kutunun içinde arıyoruz. Bu sayede sahada uçuşan rastgele balonları değil, sadece makete fiziksel olarak bağlı olan balonu hedef alıyoruz. ]
+        arama_alani_y_ust = maket.Y_alt
+        arama_alani_y_alt = maket.Y_alt + (maket.Y_alt - maket.Y_ust)
+        
+        arama_kutusu = (maket.X_sol, arama_alani_y_ust, maket.X_sag, arama_alani_y_alt)
+
+        // 2. Bu özel uzatılmış kutu içinde YOLO'nun bulduğu bir balon var mı?
+        bagli_balon = arama_kutusu_icinde_mi(tum_balonlar)
+
+        EĞER bagli_balon VARSA:
+            // Hedef hala CANLI! Balonu makete bağla ve listeye ekle.
+            maket.Hedef_Balon = bagli_balon
+            CANLI_MAKETLER.ekle(maket)
+            
+        // EĞER YOKSA: Balon patlamış demektir! Hiçbir işlem yapma, maketi yok say.
+
+    EĞER CANLI_MAKETLER BOŞ ise:
+        Donanıma_Gonder: {Motor: (0,0), Durum: "ARAMA_YAP", Ates: HAYIR}
+        DÖNGÜNÜN BAŞINA DÖN
+
+    4. AŞAMAYA GÖRE STRATEJİ VE IFF (Dost/Düşman Ayrımı)
+    dusman_listesi = []
+    
+    EĞER ASAMA_MODU == 2:
+        dusman_listesi = CANLI_MAKETLER
+        
+    EĞER ASAMA_MODU == 3:
+        HER BİR maket İÇİN (CANLI_MAKETLER):
+            renk = Piksellerden_Renk_Analizi_Yap(maket.BBox)
+            EĞER renk == "KIRMIZI":
+                dusman_listesi.ekle(maket)
+
+    EĞER dusman_listesi BOŞ ise:
+        Donanıma_Gonder: {Motor: (0,0), Durum: "BEKLE", Ates: HAYIR}
+        DÖNGÜNÜN BAŞINA DÖN
+
+    5. ANA HEDEF SEÇİMİ VE NİŞAN ALMA
+    // Merkeze en yakın düşmanı seç (Taret savrulmasını önle)
+    ana_hedef = Ekrana_En_Yakin_Olani_Sec(dusman_listesi, Görüntü_Merkezi)
+
+    // Makete değil, DOĞRUDAN makete bağlı balonun merkezine nişan alıyoruz!
+    hedef_x, hedef_y = ana_hedef.Hedef_Balon.Merkez
+
+    // Motorların titrememesi için koordinatları filtrele
+    hedef_x, hedef_y = Kalman_Filtresinden_Gecir(hedef_x, hedef_y)
+
+    6. HATA HESAPLAMA
+    hata_x = hedef_x - Görüntü_Merkezi_X
+    hata_y = hedef_y - Görüntü_Merkezi_Y
+
+    7. KİLİTLENME VE KESİNTİSİZ ATIŞ (Feedback Loop) | Titreme (Jitter) problemini ve nokta atışı isabet çözümü için
+    kilitlendi_mi = (Mutlak(hata_x) < TOLERANS) VE (Mutlak(hata_y) < TOLERANS)
+    ates_et = HAYIR
+
+    // Verification Delay (3_Frame)
+    // 30 FPS bir kamerada 3 Frame'in işlenmesi yaklaşık 100 ms sürer. 
+    // 60 FPS de 3 Frame-> 50 ms (frame sayısını 5, 10_Frame yapabiliriz. Hızlı geçtiği için) | Sisteme göre değişiyor. Örn: namlu yönlenirken titreme yapıyorsa demekki frame sayısını arttırmalıyızki daha net tespit yapabilsin ve titremesini min tutabilelim.
+
+    -----------
+    if kilitlendi_mi:
+            # Hedef namlunun ucunda! Sayacı artır.
+           kilitlenme_sayaci += 1
+        else:
+            # Hedef tolerans dışına çıktı (kaydı). Sayacı sıfırla!
+            kilitlenme_sayaci = 0
+    -------------
+    
+    EĞER kilitlendi_mi == EVET VE Kilitlenme_Süresi > 3_Frame:   
+    
+    --------------------------------------
+    # Eğer hedef aralıksız olarak 3 frame (veya belirlediğiniz sayı) boyunca
+    # namlunun ucunda kalmayı başardıysa, atış onayı ver.
+    if kilitlenme_sayaci >= HEDEF_BEKLEME_SURESI:
+        
+        if ASAMA_MODU == 2:
+            ates_et = True
+            
+        elif ASAMA_MODU == 3:
+            min_m, max_m = Menzil_Kuralini_Getir(ana_hedef.sinifi)
+            if min_m <= lidar_mesafesi <= max_m:
+                ates_et = True
+            else:
+                # Kilitliyiz ama mesafe uygun değil. Bekle.
+                ates_et = False
+    ---------------------------------------
+    
+
+// 3_Frame -> sistemin ateş etmeden önce "nefesini tutması" gibi.  
+//Sistem şu şekilde sayar (30FPS):
+//Frame 1: Hedef namlunun ucunda! (Hata payı toleransın altında). Sayacı 1 yap. Bekle, ateş etme.
+//Frame 2 (33ms sonra): Hedef hala namlunun ucunda mı? Motorlar durabilmiş mi? Evet. Sayacı 2 yap. Bekle.
+//Frame 3 (66ms sonra): Hedef hala tam namlunun ucunda mı? Evet! namlu tamamen sabitlenmiş, kilitlenme doğrulandı. ATEŞ ET!
+//Kritik Olarak: Eğer sistem 2. Frame'de hedefin merkezden biraz bile kaydığını görürse, sayaç direk SIFIRLANIR. Sistem hedefi tekrar merkeze alıp baştan "1, 2, 3" diye saymak zorundadır.
+
+        EĞER ASAMA_MODU == 2:
+            ates_et = EVET
+            
+        EĞER ASAMA_MODU == 3:
+            min_m, max_m = Menzil_Kuralini_Getir(ana_hedef.Sınıfı)
+            EĞER (lidar_mesafesi >= min_m) VE (lidar_mesafesi <= max_m):
+                ates_et = EVET
+
+    // Not: Sistem 'ates_et = EVET' oldukça namluyu balonda tutacak
+    // Balon patladığı an, bir sonraki frame'de 3. Adım'daki 
+    // 'bagli_balon VARSA' şartı sağlanmayacak ve sistem otomatik olarak 
+    // yeni bir hedefe yönelecek. Hedefin imha edildiği DOĞRULANMIŞ olacak.
+
+    8. DONANIMA EMİR GÖNDERİMİ / Atış kontrol tarafı diye düşünüyorum.
+    Donanim_Paketi = {
+        Hata_X: hata_x,
+        Hata_Y: hata_y,
+        Durum: ates_et ? "ATES_EDILIYOR" : (kilitlendi_mi ? "KILITLI" : "TAKIP"),
+        Ates_Tetik: ates_et
+    }
+    Seri_Port_Ile_Gonder(Donanim_Paketi)
+
+DÖNGÜ BİTİR
+========================================================================
+
+
+EKSTRA 
+//
+7. BLOK ÇALIŞMASI
+Bu Kod Bloğu Nasıl Çalışır?
+1. Frame (hata_x = 10, hata_y = 5): Toleransın (15) altındayız. kilitlendi_mi = True olur. Sayaç 0'dan 1'e çıkar. Atış yapılmaz (1 >= 3 değil).
+
+2. Frame (hata_x = 12, hata_y = 8): Hala toleransın altındayız. Sayaç 1'den 2'ye çıkar. Atış yapılmaz.
+
+3. Frame (hata_x = 18, hata_y = 2): Eyvah! X ekseninde hedef 18 piksele kaydı (Tolerans 15'ti). kilitlendi_mi = False olur. Sayaç anında 0'a düşer. Sistem tetiği çekmekten son anda vazgeçer.
+
+4. Frame, 5. Frame, 6. Frame: Hedef tekrar yakalanır ve aralıksız 3 frame boyunca tolerans içinde kalır. Sayaç 3 olur. Sistem ates_et = True sinyalini donanıma çakar.
+//
